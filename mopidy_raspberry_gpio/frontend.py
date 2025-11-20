@@ -85,7 +85,7 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
                 else:
                     self.last_states[pin] = state
 
-            time.sleep(0.01)
+            time.sleep(0.0005)
 
     def find_pin_rotenc(self, pin):
         for encoder in self.rot_encoders.values():

@@ -26,7 +26,7 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         self.last_states = {}
         self._stop_polling = threading.Event()
 
-        # Iterate through any bcmN pins in the config
+        # Setup pins
         for key in self.config:
             if key.startswith("bcm"):
                 pin = int(key.replace("bcm", ""))
@@ -35,10 +35,9 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
                     continue
 
                 logger.info("Configuring " + key + " " + str(settings))
-                pull = GPIO.PUD_UP
-                if settings.active == "active_high":
-                    pull = GPIO.PUD_DOWN
+                pull = GPIO.PUD_UP if settings.active != "active_high" else GPIO.PUD_DOWN
 
+                # Handle rotary encoders
                 if "rotenc_id" in settings.options:
                     rotenc_id = settings.options["rotenc_id"]
                     encoder = self.rot_encoders.get(rotenc_id)
@@ -64,28 +63,37 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
 
     def _poll_loop(self):
         import RPi.GPIO as GPIO
+
         while not self._stop_polling.is_set():
             for pin, settings in self.pin_settings.items():
-                try:
-                    state = GPIO.input(pin)
-                except RuntimeError:
-                    continue  # GPIO cleaned up, skip
-
+                state = GPIO.input(pin)
                 last = self.last_states[pin]
-                if state != last:
-                    active_low = settings.active != "active_high"
-                    # detect press: falling edge if active_low, rising if active_high
-                    if (active_low and last == GPIO.HIGH and state == GPIO.LOW) or (
-                        not active_low and last == GPIO.LOW and state == GPIO.HIGH
-                    ):
-                        self.gpio_event(pin)
-                        time.sleep(settings.bouncetime / 1000.0)  # debounce
 
-                    self.last_states[pin] = GPIO.input(pin)
-                else:
+                # Rotary encoder pins: fast polling, no debounce
+                if "rotenc_id" in settings.options:
+                    if state != last:
+                        encoder = self.rot_encoders[settings.options["rotenc_id"]]
+                        event = encoder.get_event(pin)
+                        if event:
+                            logger.info(
+                                "Rotary encoder bcm%d event: %s", pin, event
+                            )
+                            self.dispatch_input(event, settings.options)
                     self.last_states[pin] = state
+                    continue
 
-            time.sleep(0.0005)
+                # Button pins: detect edges with debounce
+                active_low = settings.active != "active_high"
+                if (active_low and last == GPIO.HIGH and state == GPIO.LOW) or (
+                    not active_low and last == GPIO.LOW and state == GPIO.HIGH
+                ):
+                    self.gpio_event(pin)
+                    time.sleep(settings.bouncetime / 1000.0)  # debounce
+
+                self.last_states[pin] = state
+
+            # Small sleep to reduce CPU usage, but fast enough for encoders
+            time.sleep(0.0005)  # 2 kHz polling
 
     def find_pin_rotenc(self, pin):
         for encoder in self.rot_encoders.values():
@@ -97,7 +105,7 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         event = settings.event
         encoder = self.find_pin_rotenc(pin)
         if encoder:
-            event = encoder.get_event()
+            event = encoder.get_event(pin)
 
         if event:
             logger.info(
@@ -112,7 +120,6 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         except AttributeError:
             raise RuntimeError(f"Could not find input handler for event: {event}")
 
-    # --- handle_* methods remain unchanged ---
     def handle_play_pause(self, config):
         if self.core.playback.get_state().get() == core.PlaybackState.PLAYING:
             self.core.playback.pause()

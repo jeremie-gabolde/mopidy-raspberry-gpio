@@ -105,7 +105,7 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         event = settings.event
         encoder = self.find_pin_rotenc(pin)
         if encoder:
-            event = encoder.get_event(pin)
+            event = encoder.get_event()
 
         if event:
             logger.info(

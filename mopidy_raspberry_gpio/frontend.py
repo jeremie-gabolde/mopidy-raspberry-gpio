@@ -73,7 +73,7 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
                 if "rotenc_id" in settings.options:
                     if state != last:
                         encoder = self.rot_encoders[settings.options["rotenc_id"]]
-                        event = encoder.get_event(pin)
+                        event = encoder.get_event()
                         if event:
                             logger.info(
                                 "Rotary encoder bcm%d event: %s", pin, event

@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 
 import pykka
 from mopidy import core, models
@@ -21,8 +23,10 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
 
+        self.last_states = {}
+        self._stop_polling = threading.Event()
+
         # Iterate through any bcmN pins in the config
-        # and set them up as inputs with edge detection
         for key in self.config:
             if key.startswith("bcm"):
                 pin = int(key.replace("bcm", ""))
@@ -32,34 +36,56 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
 
                 logger.info("Configuring " + key + " " + str(settings))
                 pull = GPIO.PUD_UP
-                edge = GPIO.FALLING
                 if settings.active == "active_high":
                     pull = GPIO.PUD_DOWN
-                    edge = GPIO.RISING
 
                 if "rotenc_id" in settings.options:
-                    edge = GPIO.BOTH
                     rotenc_id = settings.options["rotenc_id"]
-                    encoder = None
-                    if rotenc_id in self.rot_encoders.keys():
-                        encoder = self.rot_encoders[rotenc_id]
-                    else:
+                    encoder = self.rot_encoders.get(rotenc_id)
+                    if not encoder:
                         encoder = RotEncoder(rotenc_id)
                         self.rot_encoders[rotenc_id] = encoder
                     encoder.add_pin(pin, settings.event)
 
                 GPIO.setup(pin, GPIO.IN, pull_up_down=pull)
-
-                GPIO.add_event_detect(
-                    pin,
-                    edge,
-                    callback=self.gpio_event,
-                    bouncetime=settings.bouncetime,
-                )
-
                 self.pin_settings[pin] = settings
+                self.last_states[pin] = GPIO.input(pin)
 
-        # TODO validate all self.rot_encoders have two pins
+    def on_start(self):
+        # Start polling thread
+        self._polling_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._polling_thread.start()
+
+    def on_stop(self):
+        self._stop_polling.set()
+        self._polling_thread.join(timeout=1)
+        import RPi.GPIO as GPIO
+        GPIO.cleanup()
+
+    def _poll_loop(self):
+        import RPi.GPIO as GPIO
+        while not self._stop_polling.is_set():
+            for pin, settings in self.pin_settings.items():
+                try:
+                    state = GPIO.input(pin)
+                except RuntimeError:
+                    continue  # GPIO cleaned up, skip
+
+                last = self.last_states[pin]
+                if state != last:
+                    active_low = settings.active != "active_high"
+                    # detect press: falling edge if active_low, rising if active_high
+                    if (active_low and last == GPIO.HIGH and state == GPIO.LOW) or (
+                        not active_low and last == GPIO.LOW and state == GPIO.HIGH
+                    ):
+                        self.gpio_event(pin)
+                        time.sleep(settings.bouncetime / 1000.0)  # debounce
+
+                    self.last_states[pin] = GPIO.input(pin)
+                else:
+                    self.last_states[pin] = state
+
+            time.sleep(0.01)
 
     def find_pin_rotenc(self, pin):
         for encoder in self.rot_encoders.values():
@@ -84,10 +110,9 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
         try:
             getattr(self, handler_name)(options)
         except AttributeError:
-            raise RuntimeError(
-                f"Could not find input handler for event: {event}"
-            )
+            raise RuntimeError(f"Could not find input handler for event: {event}")
 
+    # --- handle_* methods remain unchanged ---
     def handle_play_pause(self, config):
         if self.core.playback.get_state().get() == core.PlaybackState.PLAYING:
             self.core.playback.pause()
@@ -109,21 +134,17 @@ class RaspberryGPIOFrontend(pykka.ThreadingActor, core.CoreListener):
     def handle_volume_up(self, config):
         step = int(config.get("step", 5))
         volume = self.core.mixer.get_volume().get()
-        volume += step
-        volume = min(volume, 100)
+        volume = min(volume + step, 100)
         self.core.mixer.set_volume(volume)
 
     def handle_volume_down(self, config):
         step = int(config.get("step", 5))
         volume = self.core.mixer.get_volume().get()
-        volume -= step
-        volume = max(volume, 0)
+        volume = max(volume - step, 0)
         self.core.mixer.set_volume(volume)
 
     def handle_playlist(self, config):
-        playlist: models.Playlist = self.core.playlists.lookup(
-            config.get("uri")
-        ).get()
+        playlist: models.Playlist = self.core.playlists.lookup(config.get("uri")).get()
         self.core.tracklist.clear()
         self.core.tracklist.add(tracks=playlist.tracks)
         self.core.playback.play()
